@@ -22,7 +22,7 @@ never edits workflows, rulesets or secrets. Each repository's ruleset still requ
 
 | Workflow | Kind | What it does |
 | --- | --- | --- |
-| [`board-sync.yml`](.github/workflows/board-sync.yml) | reusable | Adds issues to the board, moves `agent`-labelled issues to Ready, moves an umbrella issue to In Progress when work on a sub-issue starts |
+| [`board-sync.yml`](.github/workflows/board-sync.yml) | reusable | Adds issues to the board (filling their Track from the repository's other items), moves `agent`-labelled issues to Ready, moves an umbrella issue to In Progress when work on a sub-issue starts |
 | [`agent.yml`](.github/workflows/agent.yml) | reusable | Runs [Claude Code](https://github.com/anthropics/claude-code-action) on an `agent`-labelled issue: reads the repository's context base, implements, runs the local gate and opens the pull request. One agent at a time per repository |
 | [`ci.yml`](.github/workflows/ci.yml), [`codeql.yml`](.github/workflows/codeql.yml) | this repository | actionlint and CodeQL on the workflows themselves |
 
