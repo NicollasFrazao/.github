@@ -1,0 +1,130 @@
+name: Agent
+
+# Reusable. An agent implements one issue on its own branch and opens a pull request that closes
+# it. The owner reviews and merges; the agent never merges, never pushes to the base branch and
+# never touches workflows, rulesets or secrets.
+on:
+  workflow_call:
+    inputs:
+      base-branch:
+        description: Branch the pull request targets.
+        type: string
+        default: master
+      max-turns:
+        description: Upper bound on agent turns, a cap on usage per issue.
+        type: number
+        default: 80
+      sync-board:
+        description: Move the issue to In Progress when the agent starts (needs BOARD_TOKEN).
+        type: boolean
+        default: false
+      project-number:
+        description: Number of the user project that holds the board.
+        type: number
+        default: 3
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Subscription token from `claude setup-token`.
+        required: true
+      AGENT_GITHUB_TOKEN:
+        description: >-
+          Token the agent pushes and opens the pull request with. Pull requests opened with the
+          default GITHUB_TOKEN do not trigger CI; without this secret the Claude GitHub App is used.
+        required: false
+      BOARD_TOKEN:
+        required: false
+
+permissions: {}
+
+# One agent at a time per repository: a second labelled issue waits in Ready.
+concurrency:
+  group: agent-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    name: agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Move the issue to In Progress
+        if: inputs.sync-board
+        uses: actions/github-script@v9
+        env:
+          PROJECT_NUMBER: ${{ inputs.project-number }}
+        with:
+          github-token: ${{ secrets.BOARD_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const { user, repository } = await github.graphql(
+              `query($login: String!, $number: Int!, $repo: String!, $issue: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+                  }
+                }
+                repository(owner: $login, name: $repo) {
+                  issue(number: $issue) { projectItems(first: 20) { nodes { id project { id } } } }
+                }
+              }`,
+              { login: owner, number: Number(process.env.PROJECT_NUMBER), repo, issue: context.issue.number },
+            );
+            const project = user.projectV2;
+            const item = repository.issue.projectItems.nodes.find((candidate) => candidate.project.id === project.id);
+            if (!item) {
+              core.warning('The issue is not on the board; board-sync adds it when it is labelled.');
+              return;
+            }
+            await github.graphql(
+              `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project, itemId: $item, fieldId: $field,
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }`,
+              {
+                project: project.id,
+                item: item.id,
+                field: project.field.id,
+                option: project.field.options.find((option) => option.name === 'In Progress').id,
+              },
+            );
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Implement the issue
+        uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.AGENT_GITHUB_TOKEN }}
+          claude_args: >-
+            --max-turns ${{ inputs.max-turns }}
+            --allowedTools "Bash,Read,Edit,Write,Glob,Grep"
+          prompt: |
+            Implement issue #${{ github.event.issue.number }} of ${{ github.repository }}.
+
+            1. Read the issue with its comments (`gh issue view ${{ github.event.issue.number }} --comments`),
+               then the context index `.context/docs/README.md` and every document it names as
+               mandatory reading. Those conventions are binding.
+            2. Create the branch `agent/issue-${{ github.event.issue.number }}` from `${{ inputs.base-branch }}`.
+            3. Implement only what the issue asks, with tests and documentation as the conventions
+               require. Keep the change small enough to review in one sitting.
+            4. Run the repository's local quality gate (named in `development-conventions.md`) and
+               fix every finding until it passes.
+            5. Commit with Conventional Commits, push the branch and open a pull request against
+               `${{ inputs.base-branch }}` with `gh pr create`. Use `.github/pull_request_template.md`;
+               the Issue section says `Closes #${{ github.event.issue.number }}` and Verification lists
+               the real results of the gate.
+            6. Never push to `${{ inputs.base-branch }}`, never merge, never force-push, and never change
+               `.github/workflows`, rulesets or secrets.
+
+            If the issue is ambiguous or you are blocked, comment on the issue with what is missing
+            and stop without opening a pull request.
