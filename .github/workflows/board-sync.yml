@@ -54,6 +54,7 @@ jobs:
                   projectV2(number: $number) {
                     id
                     field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+                    track: field(name: "Track") { ... on ProjectV2SingleSelectField { id options { id name } } }
                   }
                 }
               }`,
@@ -123,6 +124,73 @@ jobs:
               return repository.issue;
             };
 
+            // An issue without a Track takes the most common Track of its repository's other items, so
+            // views filtered by Track show it. A board without a Track field skips this.
+            const fillTrack = async (itemId) => {
+              if (!project.track) {
+                return;
+              }
+              const { node: current } = await github.graphql(
+                `query($id: ID!) {
+                  node(id: $id) {
+                    ... on ProjectV2Item {
+                      fieldValueByName(name: "Track") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+                    }
+                  }
+                }`,
+                { id: itemId },
+              );
+              if (current.fieldValueByName) {
+                return;
+              }
+              const counts = new Map();
+              let after = null;
+              do {
+                const { node } = await github.graphql(
+                  `query($id: ID!, $after: String) {
+                    node(id: $id) {
+                      ... on ProjectV2 {
+                        items(first: 100, after: $after) {
+                          pageInfo { hasNextPage endCursor }
+                          nodes {
+                            fieldValueByName(name: "Track") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+                            content {
+                              ... on Issue { repository { nameWithOwner } }
+                              ... on PullRequest { repository { nameWithOwner } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  { id: project.id, after },
+                );
+                for (const other of node.items.nodes) {
+                  const name = other.fieldValueByName?.name;
+                  if (name && other.content?.repository?.nameWithOwner === `${owner}/${repo}`) {
+                    counts.set(name, (counts.get(name) ?? 0) + 1);
+                  }
+                }
+                after = node.items.pageInfo.hasNextPage ? node.items.pageInfo.endCursor : null;
+              } while (after);
+              const [best] = [...counts].sort((left, right) => right[1] - left[1]);
+              if (!best) {
+                core.info('No Track to infer: no other item of this repository has one.');
+                return;
+              }
+              const option = project.track.options.find((candidate) => candidate.name === best[0]);
+              await github.graphql(
+                `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }`,
+                { project: project.id, item: itemId, field: project.track.id, option: option.id },
+              );
+              core.info(`Track ${best[0]} on item ${itemId}`);
+            };
+
             // Work on a sub-issue has started: an umbrella issue that had not started moves along.
             const startParent = async (number) => {
               const { parent } = await issue(number);
@@ -139,6 +207,7 @@ jobs:
               const number = Number(process.env.FORCED_ISSUE);
               const item = await boardItem((await issue(number)).id);
               await setStatus(item.id, process.env.FORCED_STATUS);
+              await fillTrack(item.id);
               await startParent(number);
               return;
             }
@@ -147,6 +216,7 @@ jobs:
 
             if (eventName === 'issues') {
               const item = await boardItem(payload.issue.node_id);
+              await fillTrack(item.id);
               if (payload.action === 'labeled' && payload.label?.name === process.env.READY_LABEL) {
                 await setStatus(item.id, 'Ready');
               }
