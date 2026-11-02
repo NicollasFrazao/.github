@@ -18,6 +18,10 @@ on:
         description: Move the issue to In Progress when the agent starts (needs BOARD_TOKEN).
         type: boolean
         default: false
+      project-number:
+        description: Number of the user project that holds the board.
+        type: number
+        default: 3
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: Subscription token from `claude setup-token`.
@@ -38,19 +42,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  start:
-    if: inputs.sync-board
-    uses: NicollasFrazao/.github/.github/workflows/board-sync.yml@master
-    with:
-      status: In Progress
-      issue-number: ${{ github.event.issue.number }}
-    secrets:
-      BOARD_TOKEN: ${{ secrets.BOARD_TOKEN }}
-
   implement:
     name: agent
-    needs: start
-    if: always() && needs.start.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -59,9 +52,51 @@ jobs:
       issues: write
       id-token: write
     steps:
+      - name: Move the issue to In Progress
+        if: inputs.sync-board
+        uses: actions/github-script@v9
+        env:
+          PROJECT_NUMBER: ${{ inputs.project-number }}
+        with:
+          github-token: ${{ secrets.BOARD_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const { user, repository } = await github.graphql(
+              `query($login: String!, $number: Int!, $repo: String!, $issue: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+                  }
+                }
+                repository(owner: $login, name: $repo) {
+                  issue(number: $issue) { projectItems(first: 20) { nodes { id project { id } } } }
+                }
+              }`,
+              { login: owner, number: Number(process.env.PROJECT_NUMBER), repo, issue: context.issue.number },
+            );
+            const project = user.projectV2;
+            const item = repository.issue.projectItems.nodes.find((candidate) => candidate.project.id === project.id);
+            if (!item) {
+              core.warning('The issue is not on the board; board-sync adds it when it is labelled.');
+              return;
+            }
+            await github.graphql(
+              `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project, itemId: $item, fieldId: $field,
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }`,
+              {
+                project: project.id,
+                item: item.id,
+                field: project.field.id,
+                option: project.field.options.find((option) => option.name === 'In Progress').id,
+              },
+            );
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.base-branch }}
           fetch-depth: 0
       - name: Implement the issue
         uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1
