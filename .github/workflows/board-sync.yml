@@ -1,0 +1,172 @@
+name: Board sync
+
+# Reusable. Keeps a user project (board) in step with the issues and pull requests of the calling
+# repository. The built-in project workflows do the rest: "Item added" sets Todo, "Pull request
+# linked to issue" sets In review, "Item closed" and "Pull request merged" set Done.
+on:
+  workflow_call:
+    inputs:
+      project-number:
+        description: Number of the user project that holds the board.
+        type: number
+        default: 3
+      ready-label:
+        description: Label that releases an issue to the agent; the issue moves to Ready.
+        type: string
+        default: agent
+      status:
+        description: Set this status on `issue-number` instead of reacting to the event.
+        type: string
+        default: ''
+      issue-number:
+        description: Issue to update when `status` is set.
+        type: number
+        default: 0
+    secrets:
+      BOARD_TOKEN:
+        description: Classic token with the `project` scope; the default token cannot reach user projects.
+        required: true
+
+permissions: {}
+
+jobs:
+  sync:
+    name: board-sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update the board
+        uses: actions/github-script@v9
+        env:
+          PROJECT_NUMBER: ${{ inputs.project-number }}
+          READY_LABEL: ${{ inputs.ready-label }}
+          FORCED_STATUS: ${{ inputs.status }}
+          FORCED_ISSUE: ${{ inputs.issue-number }}
+        with:
+          github-token: ${{ secrets.BOARD_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const NOT_STARTED = new Set([null, 'Todo', 'Ready']);
+
+            const { user } = await github.graphql(
+              `query($login: String!, $number: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+                  }
+                }
+              }`,
+              { login: owner, number: Number(process.env.PROJECT_NUMBER) },
+            );
+            const project = user.projectV2;
+
+            const optionId = (name) => {
+              const option = project.field.options.find((candidate) => candidate.name === name);
+              if (!option) {
+                throw new Error(`The board has no status "${name}".`);
+              }
+              return option.id;
+            };
+
+            // The issue's card on this board, added when missing.
+            const boardItem = async (contentId) => {
+              const { node } = await github.graphql(
+                `query($id: ID!) {
+                  node(id: $id) {
+                    ... on Issue {
+                      projectItems(first: 20) {
+                        nodes {
+                          id
+                          project { id }
+                          fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { id: contentId },
+              );
+              const existing = node.projectItems.nodes.find((item) => item.project.id === project.id);
+              if (existing) {
+                return { id: existing.id, status: existing.fieldValueByName?.name ?? null };
+              }
+              const added = await github.graphql(
+                `mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
+                }`,
+                { project: project.id, content: contentId },
+              );
+              return { id: added.addProjectV2ItemById.item.id, status: null };
+            };
+
+            const setStatus = async (itemId, name) => {
+              await github.graphql(
+                `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }`,
+                { project: project.id, item: itemId, field: project.field.id, option: optionId(name) },
+              );
+              core.info(`Status ${name} on item ${itemId}`);
+            };
+
+            const issue = async (number) => {
+              const { repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) { issue(number: $number) { id parent { id } } }
+                }`,
+                { owner, repo, number },
+              );
+              return repository.issue;
+            };
+
+            // Work on a sub-issue has started: an umbrella issue that had not started moves along.
+            const startParent = async (number) => {
+              const { parent } = await issue(number);
+              if (!parent) {
+                return;
+              }
+              const item = await boardItem(parent.id);
+              if (NOT_STARTED.has(item.status)) {
+                await setStatus(item.id, 'In Progress');
+              }
+            };
+
+            if (process.env.FORCED_STATUS) {
+              const number = Number(process.env.FORCED_ISSUE);
+              const item = await boardItem((await issue(number)).id);
+              await setStatus(item.id, process.env.FORCED_STATUS);
+              await startParent(number);
+              return;
+            }
+
+            const { eventName, payload } = context;
+
+            if (eventName === 'issues') {
+              const item = await boardItem(payload.issue.node_id);
+              if (payload.action === 'labeled' && payload.label?.name === process.env.READY_LABEL) {
+                await setStatus(item.id, 'Ready');
+              }
+              return;
+            }
+
+            if (eventName === 'pull_request') {
+              const { repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      closingIssuesReferences(first: 20) { nodes { number repository { nameWithOwner } } }
+                    }
+                  }
+                }`,
+                { owner, repo, number: payload.pull_request.number },
+              );
+              const linked = repository.pullRequest.closingIssuesReferences.nodes
+                .filter((linkedIssue) => linkedIssue.repository.nameWithOwner === `${owner}/${repo}`);
+              for (const linkedIssue of linked) {
+                await startParent(linkedIssue.number);
+              }
+            }
